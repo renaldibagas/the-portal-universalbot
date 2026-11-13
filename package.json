@@ -16,8 +16,10 @@
   },
   "dependencies": {
     "@libsql/client": "^0.18.0",
-    "better-sqlite3": "^11.8.1",
     "discord.js": "^14.17.3",
     "dotenv": "^16.4.7"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^11.8.1"
   }
 }
