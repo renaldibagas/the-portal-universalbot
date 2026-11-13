@@ -284,21 +284,10 @@ async function getPage(title) {
   } catch (e) { logger.warn('wiki', 'page_error', { err: e, title }); return null; }
 }
 
+// Resolve only on an exact page hit (redirects included). Anything ambiguous falls
+// through to the suggestion picker so the user chooses the page themselves.
 async function resolve(query) {
-  let page = await getPage(query);
-  if (page) return page;
-  let results = await search(query, 5);
-  if (results.length) { page = await getPage(results[0].title); if (page) return page; }
-  const words = String(query).trim().split(/\s+/);
-  if (words.length > 1) {
-    results = await search(words.slice(0, -1).join(' '), 5);
-    if (results.length) { page = await getPage(results[0].title); if (page) return page; }
-  }
-  if (words[0] && norm(words[0]) !== norm(query)) {
-    results = await search(words[0], 5);
-    if (results.length) { page = await getPage(results[0].title); if (page) return page; }
-  }
-  return null;
+  return await getPage(query);
 }
 
 async function suggest(query, limit = 5) {
@@ -431,15 +420,20 @@ function detailButtons(page) {
 }
 
 async function buildSuggestions(query) {
-  const results = await suggest(query, 5);
+  const results = await suggest(query, 8);
   if (!results.length) return null;
   const row = new ActionRowBuilder();
-  for (const r of results.slice(0, 5)) {
+  const ranked = [...results].sort((a, b) => {
+    const q = norm(query);
+    const score = (t) => { const n = norm(t); return n === q ? 0 : n.startsWith(q) ? 1 : 2; };
+    return score(a.title) - score(b.title);
+  });
+  for (const r of ranked.slice(0, 5)) {
     row.addComponents(new ButtonBuilder().setCustomId('wk_p:' + encodeTitle(r.title)).setLabel(String(r.title).slice(0, 80)).setStyle(ButtonStyle.Secondary));
   }
-  const e = base({ title: 'No exact match found', description: `I couldn't find a page for **"${String(query).slice(0, 150)}"**. Did you mean one of these?`, color: theme.colors.wiki, mod: 'wiki' });
-  const list = results.map((r, i) => `${i + 1}. **${r.title}**${r.snippet ? ` — ${r.snippet.slice(0, 120)}` : ''}`).join('\n');
-  e.addFields({ name: 'Suggestions', value: list.slice(0, 1024), inline: false });
+  const e = base({ title: 'Which page do you want?', description: `No page is titled exactly **"${String(query).slice(0, 150)}"**. Pick one of these matches:`, color: theme.colors.wiki, mod: 'wiki' });
+  const list = ranked.map((r, i) => `${i + 1}. **${r.title}**${r.snippet ? ` — ${r.snippet.slice(0, 120)}` : ''}`).join('\n');
+  e.addFields({ name: 'Matches', value: list.slice(0, 1024), inline: false });
   return { embeds: [e], components: [row] };
 }
 
@@ -530,7 +524,7 @@ function register(ctx) {
     const page = await resolve(query);
     if (!page) {
       const sug = await buildSuggestions(query);
-      if (sug) { await interaction.editReply(sug); return; }
+      if (sug) { await interaction.editReply({ ...sug, content: null }); return; }
       await interaction.editReply({ content: `No wiki page found for "${query}". Try different keywords.` });
       return;
     }
@@ -542,7 +536,7 @@ function register(ctx) {
     const page = await resolve(query);
     if (!page) {
       const sug = await buildSuggestions(query);
-      if (sug) { await interaction.editReply(sug); return; }
+      if (sug) { await interaction.editReply({ ...sug, content: null }); return; }
       await interaction.editReply({ content: `No item found for "${query}". Try different keywords.` });
       return;
     }
