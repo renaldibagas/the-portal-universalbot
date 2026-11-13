@@ -63,7 +63,7 @@ async function createEvent(interaction) {
     { name: 'Host', value: `<@${interaction.user.id}>`, inline: true },
     { name: 'Status', value: 'OPEN', inline: true }
   );
-  e.addFields({ name: 'Starts', value: 'Not set yet — press **Set Start Time** below.', inline: false });
+  e.addFields({ name: 'Times', value: 'Set **Start Time** and **Registration Close** with the buttons below (WIB picker).', inline: false });
   e.addFields({ name: 'Next steps', value: 'Players press **Join Event** on the event overview, or add them with `/event add`. Track scores with `/event score`.', inline: false });
   await interaction.reply({ embeds: [e], components: [...joinLeaveRow({ id, status: 'OPEN' }), startRow({ id, status: 'OPEN' })] });
 }
@@ -83,7 +83,8 @@ async function listEvents(interaction) {
 
 function startRow(ev) {
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`evt_st:${ev.id}`).setLabel('Set Start Time').setStyle(ButtonStyle.Primary)
+    new ButtonBuilder().setCustomId(`evt_st:${ev.id}`).setLabel('Set Start Time').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`evt_sc:${ev.id}`).setLabel('Set Registration Close').setStyle(ButtonStyle.Secondary)
   );
   return row;
 }
@@ -113,10 +114,10 @@ function wibEpoch(ymd, h, m) {
   return Math.floor(Date.UTC(y, mo - 1, d, h, m) / 1000) - WIB_OFFSET_SEC;
 }
 
-function dateSelect(id, msgId) {
+function dateSelect(target, id, msgId) {
   const today = wibTodayYmd();
   const menu = new StringSelectMenuBuilder()
-    .setCustomId(`evt_d:${id}:${msgId}`)
+    .setCustomId(`evt_d:${target}:${id}:${msgId}`)
     .setPlaceholder('Pick the event date (WIB)')
     .addOptions(Array.from({ length: 14 }, (_, i) => {
       const ymd = addDaysYmd(today, i);
@@ -125,17 +126,17 @@ function dateSelect(id, msgId) {
   return new ActionRowBuilder().addComponents(menu);
 }
 
-function hourSelect(id, msgId, ymd) {
+function hourSelect(target, id, msgId, ymd) {
   const menu = new StringSelectMenuBuilder()
-    .setCustomId(`evt_h:${id}:${msgId}:${ymd}`)
+    .setCustomId(`evt_h:${target}:${id}:${msgId}:${ymd}`)
     .setPlaceholder('Pick the hour (WIB)')
     .addOptions(Array.from({ length: 24 }, (_, h) => ({ label: hmLabel(h, 0), value: String(h) })));
   return new ActionRowBuilder().addComponents(menu);
 }
 
-function minuteSelect(id, msgId, ymd, hour) {
+function minuteSelect(target, id, msgId, ymd, hour) {
   const menu = new StringSelectMenuBuilder()
-    .setCustomId(`evt_m:${id}:${msgId}:${ymd}:${hour}`)
+    .setCustomId(`evt_m:${target}:${id}:${msgId}:${ymd}:${hour}`)
     .setPlaceholder('Pick the minutes (WIB)')
     .addOptions([0, 15, 30, 45].map(m => ({ label: hmLabel(hour, m), value: String(m) })));
   return new ActionRowBuilder().addComponents(menu);
@@ -147,11 +148,12 @@ async function buildEventView(guildId, id, interaction = null) {
   const parts = await db.all('SELECT * FROM event_participants WHERE event_id = ? ORDER BY score DESC, joined_at ASC LIMIT 30', [id]);
   const total = await db.get('SELECT COUNT(*) as c FROM event_participants WHERE event_id = ?', [id]);
   const totalCount = Number(total?.c || 0);
-  const pLines = parts.length ? parts.map((p, i) => `${i + 1}. ${participantLabel(p)} \u2014 **${p.score}** pts`).join('\n') : 'No participants yet. Press **Join Event** to enter.';
+  const pLines = parts.length ? parts.map((p, i) => `${i + 1}. ${participantLabel(p)} \u2014 **${p.score}** pts`).join('\n') : (regClosed(ev) ? 'Registration is closed.' : 'No participants yet. Press **Join Event** to enter.');
   const e = base({ title: `Event #${ev.id}: ${ev.name}`, description: ev.description ? String(ev.description).slice(0, 1500) : 'No description.', color: ev.status === 'OPEN' ? theme.colors.brand : theme.colors.neutral, mod: 'event' });
   e.addFields(
     { name: 'Status', value: ev.status, inline: true },
     { name: 'Starts', value: ev.starts_at ? `<t:${ev.starts_at}:F>\n<t:${ev.starts_at}:R>` : 'Not set', inline: true },
+    { name: 'Registration closes', value: ev.signup_closes_at ? `<t:${ev.signup_closes_at}:F>` + ' ' + (regClosed(ev) ? '**Closed**' : `<t:${ev.signup_closes_at}:R>`) : 'Not set', inline: true },
     { name: 'Host', value: `<@${ev.host_id}>`, inline: true },
     { name: 'Participants', value: String(totalCount), inline: true },
     { name: 'Created', value: `<t:${Math.floor(ev.created_at / 1000)}:f>`, inline: true },
@@ -287,8 +289,12 @@ async function closeEvent(interaction) {
   await interaction.reply({ content: `Closed event **#${id} ${ev.name}**.` });
 }
 
+function regClosed(ev) {
+  return !!(ev && ev.signup_closes_at && Math.floor(Date.now() / 1000) >= Number(ev.signup_closes_at));
+}
+
 function joinLeaveRow(ev) {
-  const open = ev.status === 'OPEN';
+  const open = ev.status === 'OPEN' && !regClosed(ev);
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId(`evt_j:${ev.id}`).setLabel('Join Event').setStyle(ButtonStyle.Success).setDisabled(!open),
     new ButtonBuilder().setCustomId(`evt_l:${ev.id}`).setLabel('Leave Event').setStyle(ButtonStyle.Danger).setDisabled(!open)
@@ -316,6 +322,7 @@ async function joinWithNickname(interaction, id, rawNick) {
   const ev = await getEvent(id, interaction.guildId);
   if (!ev) return interaction.reply({ content: `Event #${id} not found.`, ephemeral: true }).catch(() => {});
   if (ev.status !== 'OPEN') return interaction.reply({ content: `**#${ev.id} ${ev.name}** is closed.`, ephemeral: true }).catch(() => {});
+  if (regClosed(ev)) return interaction.reply({ content: `Registration for **#${ev.id} ${ev.name}** closed <t:${ev.signup_closes_at}:R>.`, ephemeral: true }).catch(() => {});
   const u = interaction.user;
   const existing = await db.get('SELECT * FROM event_participants WHERE event_id=? AND user_id=?', [id, u.id]);
   if (existing) {
@@ -346,31 +353,41 @@ async function leaveEvent(interaction, id) {
   return ok ? interaction.followUp(note).catch(() => {}) : interaction.reply(note).catch(() => {});
 }
 
-async function openStartPicker(interaction, id) {
+const TARGETS = {
+  s: { column: 'starts_at', label: 'start time', verb: 'starts' },
+  c: { column: 'signup_closes_at', label: 'registration close', verb: 'registration closes' }
+};
+
+async function openPicker(interaction, id, target) {
+  const cfg = TARGETS[target] || TARGETS.s;
   const ev = await getEvent(id, interaction.guildId);
   if (!ev) return interaction.reply({ content: `Event #${id} not found.`, ephemeral: true });
-  if (!canManageEvent(interaction, ev)) return interaction.reply({ content: 'Only the host or someone with Manage Events can set the start time.', ephemeral: true });
+  if (!canManageEvent(interaction, ev)) return interaction.reply({ content: `Only the host or someone with Manage Events can set the ${cfg.label}.`, ephemeral: true });
   const msgId = interaction.message?.id || '0';
-  const e = base({ title: `Set start time — #${ev.id} ${ev.name}`, description: `Pick a date, then hour, then minutes.\nTimes are **WIB (UTC+7)** and everyone sees them in their own timezone.${ev.starts_at ? `\n\nCurrent: <t:${ev.starts_at}:F>` : ''}`, color: theme.colors.brand, mod: 'event' });
-  return interaction.reply({ embeds: [e], components: [dateSelect(id, msgId)], ephemeral: true });
+  const current = ev[cfg.column];
+  const e = base({ title: `Set ${cfg.label} — #${ev.id} ${ev.name}`, description: `Pick a date, then hour, then minutes.\nTimes are **WIB (UTC+7)**; everyone sees them in their own timezone.${current ? `\n\nCurrent: <t:${current}:F>` : ''}`, color: theme.colors.brand, mod: 'event' });
+  return interaction.reply({ embeds: [e], components: [dateSelect(target, id, msgId)], ephemeral: true });
 }
 
-async function pickHour(interaction, id, msgId, ymd) {
-  const e = base({ title: `Start time — ${dayLabel(ymd)}`, description: 'Now pick the hour (WIB).', color: theme.colors.brand, mod: 'event' });
-  return interaction.update({ embeds: [e], components: [hourSelect(id, msgId, ymd)] });
+async function pickHour(interaction, target, id, msgId, ymd) {
+  const cfg = TARGETS[target] || TARGETS.s;
+  const e = base({ title: `${cfg.label} — ${dayLabel(ymd)}`, description: 'Now pick the hour (WIB).', color: theme.colors.brand, mod: 'event' });
+  return interaction.update({ embeds: [e], components: [hourSelect(target, id, msgId, ymd)] });
 }
 
-async function pickMinute(interaction, id, msgId, ymd, hour) {
-  const e = base({ title: `Start time — ${dayLabel(ymd)}, ${hmLabel(hour, 0).replace(':00', '')}`, description: 'Now pick the minutes.', color: theme.colors.brand, mod: 'event' });
-  return interaction.update({ embeds: [e], components: [minuteSelect(id, msgId, ymd, hour)] });
+async function pickMinute(interaction, target, id, msgId, ymd, hour) {
+  const cfg = TARGETS[target] || TARGETS.s;
+  const e = base({ title: `${cfg.label} — ${dayLabel(ymd)}, ${String(hour).padStart(2, '0')}:00 WIB`, description: 'Now pick the minutes.', color: theme.colors.brand, mod: 'event' });
+  return interaction.update({ embeds: [e], components: [minuteSelect(target, id, msgId, ymd, hour)] });
 }
 
-async function saveStart(interaction, id, msgId, ymd, hour, minute) {
+async function saveTime(interaction, target, id, msgId, ymd, hour, minute) {
+  const cfg = TARGETS[target] || TARGETS.s;
   const ev = await getEvent(id, interaction.guildId);
   if (!ev) return interaction.reply({ content: `Event #${id} not found.`, ephemeral: true });
   const epoch = wibEpoch(ymd, hour, minute);
-  await db.exec('UPDATE events SET starts_at=? WHERE id=? AND guild_id=?', [epoch, id, interaction.guildId]);
-  await interaction.update({ embeds: [base({ title: 'Start time saved', description: `**#${ev.id} ${ev.name}** starts <t:${epoch}:F> (<t:${epoch}:R>)\n_${dayLabel(ymd)} ${hmLabel(hour, minute)} WIB_`, color: theme.colors.success, mod: 'event' })], components: [] }).catch(() => {});
+  await db.exec(`UPDATE events SET ${cfg.column}=? WHERE id=? AND guild_id=?`, [epoch, id, interaction.guildId]);
+  await interaction.update({ embeds: [base({ title: `Saved ${cfg.label}`, description: `**#${ev.id} ${ev.name}** ${cfg.verb} <t:${epoch}:F> (<t:${epoch}:R>)\n_${dayLabel(ymd)} ${hmLabel(hour, minute)} WIB_`, color: theme.colors.success, mod: 'event' })], components: [] }).catch(() => {});
   if (msgId && msgId !== '0') {
     try {
       const msg = await interaction.channel.messages.fetch(msgId);
@@ -391,6 +408,7 @@ function register(ctx) {
         const ev = await getEvent(eventId, interaction.guildId);
         if (!ev) return interaction.reply({ content: `Event #${eventId} not found.`, ephemeral: true }).catch(() => {});
         if (ev.status !== 'OPEN') return interaction.reply({ content: `**#${ev.id} ${ev.name}** is closed.`, ephemeral: true }).catch(() => {});
+        if (regClosed(ev)) return interaction.reply({ content: `Registration for **#${ev.id} ${ev.name}** closed <t:${ev.signup_closes_at}:R>.`, ephemeral: true }).catch(() => {});
         return interaction.showModal(nicknameModal(eventId, ev.name));
       }
       return await leaveEvent(interaction, eventId);
@@ -420,29 +438,31 @@ function register(ctx) {
   const picker = async (interaction) => {
     try {
       const cid = String(interaction.customId || '');
-      if (cid.startsWith('evt_st:')) return await openStartPicker(interaction, parseInt(cid.split(':')[1], 10));
+      if (cid.startsWith('evt_st:')) return await openPicker(interaction, parseInt(cid.split(':')[1], 10), 's');
+      if (cid.startsWith('evt_sc:')) return await openPicker(interaction, parseInt(cid.split(':')[1], 10), 'c');
       if (cid.startsWith('evt_d:')) {
-        const [, id, msgId] = cid.split(':');
-        return await pickHour(interaction, parseInt(id, 10), msgId, interaction.values[0]);
+        const [, target, id, msgId] = cid.split(':');
+        return await pickHour(interaction, target, parseInt(id, 10), msgId, interaction.values[0]);
       }
       if (cid.startsWith('evt_h:')) {
-        const [, id, msgId, ymd] = cid.split(':');
-        return await pickMinute(interaction, parseInt(id, 10), msgId, ymd, Number(interaction.values[0]));
+        const [, target, id, msgId, ymd] = cid.split(':');
+        return await pickMinute(interaction, target, parseInt(id, 10), msgId, ymd, Number(interaction.values[0]));
       }
       if (cid.startsWith('evt_m:')) {
-        const [, id, msgId, ymd, hour] = cid.split(':');
-        return await saveStart(interaction, parseInt(id, 10), msgId, ymd, Number(hour), Number(interaction.values[0]));
+        const [, target, id, msgId, ymd, hour] = cid.split(':');
+        return await saveTime(interaction, target, parseInt(id, 10), msgId, ymd, Number(hour), Number(interaction.values[0]));
       }
       return interaction.reply({ content: 'Unknown event control.', ephemeral: true }).catch(() => {});
     } catch (err) {
       logger.error('event', 'picker_error', { err, id: interaction.customId });
-      const msg = { content: 'Could not set the start time. Try again.', ephemeral: true };
+      const msg = { content: 'Could not save the time. Try again.', ephemeral: true };
       if (interaction.deferred || interaction.replied) return interaction.editReply(msg).catch(() => {});
       return interaction.reply(msg).catch(() => {});
     }
   };
   picker.name = name;
   ctx.router.registerPrefix('evt_st:', picker);
+  ctx.router.registerPrefix('evt_sc:', picker);
   ctx.router.registerPrefix('evt_d:', picker);
   ctx.router.registerPrefix('evt_h:', picker);
   ctx.router.registerPrefix('evt_m:', picker);

@@ -111,7 +111,8 @@ CREATE TABLE IF NOT EXISTS events (
   status TEXT NOT NULL DEFAULT 'OPEN',
   created_at INTEGER NOT NULL,
   closed_at INTEGER,
-  starts_at INTEGER
+  starts_at INTEGER,
+  signup_closes_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS event_participants (
   event_id INTEGER NOT NULL,
