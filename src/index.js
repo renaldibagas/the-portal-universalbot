@@ -12,6 +12,7 @@ const stock = require('./modules/stock');
 const wiki = require('./modules/wiki');
 const weather = require('./modules/weather');
 const auction = require('./modules/auction');
+const event = require('./modules/event');
 
 async function main() {
   try {
@@ -36,6 +37,7 @@ async function main() {
   stock.register(ctx);
   wiki.register(ctx);
   weather.register(ctx);
+  event.register(ctx);
 
   client.once(Events.ClientReady, (c) => {
     logger.info('core', 'ready', { user: c.user.tag, guilds: c.guilds.cache.size });

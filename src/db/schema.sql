@@ -99,3 +99,27 @@ CREATE TABLE IF NOT EXISTS stock_target_roles (
   PRIMARY KEY (guild_id, target_norm)
 );
 CREATE INDEX IF NOT EXISTS idx_stock_target_roles_target ON stock_target_roles(target_norm);
+
+-- Event hosting
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT,
+  host_id TEXT NOT NULL,
+  host_tag TEXT,
+  status TEXT NOT NULL DEFAULT 'OPEN',
+  created_at INTEGER NOT NULL,
+  closed_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS event_participants (
+  event_id INTEGER NOT NULL,
+  user_id TEXT NOT NULL,
+  user_tag TEXT,
+  score INTEGER NOT NULL DEFAULT 0,
+  joined_at INTEGER NOT NULL,
+  PRIMARY KEY (event_id, user_id),
+  FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_events_guild ON events(guild_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_event_participants_event ON event_participants(event_id, score DESC);
