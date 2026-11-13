@@ -58,7 +58,7 @@ function stripFiles(s) {
   return String(s || '').replace(/\[\[(?:File|Image):[^\]]*\]\]/gi, '');
 }
 
-function convertTablesToText(text) {
+function convertTablesToText(text, maxRows = 12) {
   let s = String(text || '');
   // handle each wikitable block
   s = s.replace(/\{\|[\s\S]*?\|\}/g, (table) => {
@@ -94,7 +94,6 @@ function convertTablesToText(text) {
     }
     if (!parsed.length && !headers) return '';
     const linesOut = [];
-    const maxRows = 12;
     for (let i = 0; i < parsed.length && i < maxRows; i++) {
       const row = parsed[i];
       if (headers && headers.length) {
@@ -113,10 +112,12 @@ function convertTablesToText(text) {
   return s;
 }
 
-function cleanWikiText(v) {
+function cleanWikiText(v, opts = {}) {
   let s = String(v || '');
-  s = convertTablesToText(s);
+  const maxRows = Number.isFinite(opts.maxRows) ? opts.maxRows : 12;
+  s = convertTablesToText(s, maxRows);
   s = stripFiles(s);
+  s = s.replace(/\[\[Category:[^\]]*\]\]/gi, '');
   s = s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2');
   s = s.replace(/\[\[([^\]]+)\]\]/g, '$1');
   s = s.replace(/\{\{[^{}]*\}\}/g, '');
@@ -135,6 +136,7 @@ function cleanCell(raw) {
   let s = String(raw || '');
   s = s.replace(/<br\s*\/?\s*>/gi, '\n');
   s = stripFiles(s);
+  s = s.replace(/\[\[Category:[^\]]*\]\]/gi, '');
   s = s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2');
   s = s.replace(/\[\[([^\]]+)\]\]/g, '$1');
   s = s.replace(/<ref[^>]*>[\s\S]*?<\/ref>/gi, '').replace(/<ref[^>]*\/>/gi, '');
@@ -215,7 +217,7 @@ function extractSections(wikitext) {
     const cur = matches[i];
     const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
     const body = text.slice(cur.start, end).trim();
-    out[norm(cur.title)] = { title: cur.title, raw: body, text: cleanWikiText(body).slice(0, 3500) };
+    out[norm(cur.title)] = { title: cur.title, raw: body, text: cleanWikiText(body, { maxRows: 400 }).slice(0, 16000) };
   }
   return out;
 }
@@ -233,7 +235,7 @@ function summarizeLead(wikitext, infoboxMatch) {
 }
 
 async function getPage(title) {
-  const key = 'page2:' + norm(title);
+  const key = 'page3:' + norm(title);
   const cached = await cacheGet(key); if (cached) return cached;
   try {
     const data = await api({ action: 'parse', page: title, prop: 'wikitext|sections|displaytitle', redirects: 1 });
@@ -260,11 +262,11 @@ async function getPage(title) {
     const detailSections = {};
     const preferred = ['how to obtain', 'used in', 'stats', 'effects', 'notes', 'trivia', 'recipe', 'recipes', 'crafting', 'upgrade', 'upgrades', 'drops'];
     for (const keyName of preferred) {
-      if (sections[keyName]?.text) detailSections[keyName] = sections[keyName].text.slice(0, 3500);
+      if (sections[keyName]?.text) detailSections[keyName] = sections[keyName].text;
     }
     for (const [k, v] of Object.entries(sections)) {
       if (detailSections[k]) continue;
-      if (v.text && v.text.length > 20) detailSections[k] = v.text.slice(0, 2500);
+      if (v.text && v.text.length > 20) detailSections[k] = v.text.slice(0, 6000);
     }
 
     const res = {
@@ -380,8 +382,7 @@ function itemEmbed(page, { compact = true } = {}) {
   for (const [n, v] of keyRows.slice(0, 10)) e.addFields({ name: n, value: String(v).slice(0, 250), inline: true });
 
   if (compact) {
-    if (details['how to obtain']) e.addFields({ name: 'How to Obtain', value: String(details['how to obtain']).slice(0, 350) + (String(details['how to obtain']).length > 350 ? '\n*…press button for full details*' : ''), inline: false });
-    if (details['used in']) e.addFields({ name: 'Used In', value: String(details['used in']).slice(0, 350) + (String(details['used in']).length > 350 ? '\n*…press button for full details*' : ''), inline: false });
+    // overview keeps only the description + key stats; detail sections live behind buttons
   } else {
     for (const [k, v] of Object.entries(details)) {
       if (!v) continue;
@@ -442,14 +443,31 @@ async function buildSuggestions(query) {
   return { embeds: [e], components: [row] };
 }
 
-function sectionEmbed(page, sectionKey) {
+function chunkText(text, limit = 3900) {
+  const out = [];
+  let rest = String(text || '');
+  while (rest.length > limit) {
+    let cut = rest.lastIndexOf('\n', limit);
+    if (cut < limit * 0.5) cut = limit;
+    out.push(rest.slice(0, cut).trim());
+    rest = rest.slice(cut).trim();
+  }
+  if (rest) out.push(rest);
+  return out;
+}
+
+function sectionEmbeds(page, sectionKey) {
   const details = page.detailSections || {};
   const text = details[sectionKey];
   const label = sectionKey.replace(/\b\w/g, c => c.toUpperCase());
-  const e = base({ title: `${page.title} — ${label}`, description: text ? String(text).slice(0, 4000) : 'No details available for this section.', color: theme.colors.wiki, mod: 'wiki' });
-  if (page.imageUrl) e.setThumbnail(page.imageUrl);
-  if (page.url) e.setURL(page.url + '#' + encodeURIComponent(label.replace(/ /g, '_')));
-  return e;
+  const chunks = chunkText(text || 'No details available for this section.');
+  return chunks.slice(0, 10).map((chunk, i) => {
+    const title = chunks.length > 1 ? `${page.title} — ${label} (${i + 1}/${chunks.length})` : `${page.title} — ${label}`;
+    const e = base({ title, description: chunk, color: theme.colors.wiki, mod: 'wiki' });
+    if (i === 0 && page.imageUrl) e.setThumbnail(page.imageUrl);
+    if (page.url) e.setURL(page.url + '#' + encodeURIComponent(label.replace(/ /g, '_')));
+    return e;
+  });
 }
 
 function register(ctx) {
@@ -488,7 +506,7 @@ function register(ctx) {
         } else {
           navRow = new ActionRowBuilder().addComponents(overviewBtn);
         }
-        return interaction.editReply({ content: null, embeds: [sectionEmbed(page, secKey)], components: [navRow] }).catch(() => {});
+        return interaction.editReply({ content: null, embeds: sectionEmbeds(page, secKey), components: [navRow] }).catch(() => {});
       }
       if (interaction.isButton() && interaction.customId.startsWith('wk_o:')) {
         const title = decodeTitle(interaction.customId.slice(5));
