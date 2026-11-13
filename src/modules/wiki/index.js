@@ -489,11 +489,22 @@ async function buildSuggestions(query) {
   return { embeds: [e], components: rowsOut };
 }
 
-function sectionHeaderEmbed(page, label, parts) {
-  const e = base({ title: `${page.title} — ${label}`, description: parts > 1 ? `_Part 1 of ${parts}_` : '', color: theme.colors.wiki, mod: 'wiki' });
+function sectionHeaderEmbed(page, label, idx, total) {
+  const e = base({ title: `${page.title} — ${label}`, description: total > 1 ? `_Page ${idx + 1} of ${total}_` : '', color: theme.colors.wiki, mod: 'wiki' });
   if (page.imageUrl) e.setThumbnail(page.imageUrl);
   if (page.url) e.setURL(page.url + '#' + encodeURIComponent(label.replace(/ /g, '_')));
   return e;
+}
+
+function pagerRow(page, secKey, idx, total) {
+  const tEnc = encodeTitle(page.title);
+  const code = findSectionCode(secKey).code;
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`wk_g:${code}:${idx - 1}:${tEnc}`).setLabel('Previous Page').setStyle(ButtonStyle.Secondary).setDisabled(idx <= 0),
+    new ButtonBuilder().setCustomId('wk_pageinfo').setLabel(`Page ${idx + 1}/${total}`).setStyle(ButtonStyle.Secondary).setDisabled(true),
+    new ButtonBuilder().setCustomId(`wk_g:${code}:${idx + 1}:${tEnc}`).setLabel('Next Page').setStyle(ButtonStyle.Primary).setDisabled(idx >= total - 1)
+  );
+  return row;
 }
 
 function sectionPayloads(page, sectionKey) {
@@ -542,12 +553,37 @@ function register(ctx) {
           navRow = new ActionRowBuilder().addComponents(overviewBtn);
         }
         const { chunks, label } = sectionPayloads(page, secKey);
-        const header = sectionHeaderEmbed(page, label, chunks.length);
-        await interaction.editReply({ content: chunks[0], embeds: [header], components: [navRow] }).catch(() => {});
-        for (let i = 1; i < chunks.length; i++) {
-          await interaction.followUp({ content: chunks[i], embeds: [], components: [], allowedMentions: { parse: [] } }).catch(() => {});
-        }
+        const components = [navRow];
+        if (chunks.length > 1) components.push(pagerRow(page, secKey, 0, chunks.length));
+        await interaction.editReply({ content: chunks[0], embeds: [sectionHeaderEmbed(page, label, 0, chunks.length)], components }).catch(() => {});
         return;
+      }
+      if (interaction.isButton() && interaction.customId.startsWith('wk_g:')) {
+        const rest = interaction.customId.slice(5);
+        const parts = rest.split(':');
+        const code = parts[0];
+        const idx = parseInt(parts[1], 10);
+        const title = decodeTitle(parts.slice(2).join(':'));
+        if (!title || !Number.isFinite(idx)) return interaction.reply({ content: 'Invalid page.', ephemeral: true }).catch(() => {});
+        await interaction.deferUpdate().catch(() => {});
+        const page = await getPage(title);
+        if (!page) return interaction.editReply({ content: `Could not load "${title}".`, embeds: [], components: [] }).catch(() => {});
+        const secKey = resolveSectionCode(code, page.detailSections || {});
+        if (!secKey) return interaction.editReply({ content: 'Section not found.', embeds: [], components: [] }).catch(() => {});
+        const { chunks, label } = sectionPayloads(page, secKey);
+        const i = Math.min(Math.max(idx, 0), chunks.length - 1);
+        const tEnc = encodeTitle(page.title);
+        const rows = detailButtons(page);
+        const overviewBtn = new ButtonBuilder().setCustomId('wk_o:' + tEnc).setLabel('Overview').setStyle(ButtonStyle.Secondary);
+        let navRow;
+        if (rows[0]) {
+          const comps = rows[0].components.slice(0, 4);
+          comps.push(overviewBtn);
+          navRow = new ActionRowBuilder().addComponents(comps);
+        } else {
+          navRow = new ActionRowBuilder().addComponents(overviewBtn);
+        }
+        return interaction.editReply({ content: chunks[i], embeds: [sectionHeaderEmbed(page, label, i, chunks.length)], components: [navRow, pagerRow(page, secKey, i, chunks.length)] }).catch(() => {});
       }
       if (interaction.isButton() && interaction.customId.startsWith('wk_o:')) {
         const title = decodeTitle(interaction.customId.slice(5));
