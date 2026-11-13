@@ -1,4 +1,4 @@
-const { PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const db = require('../../db');
 const logger = require('../../core/logger');
 const { base } = require('../../ui/embeds');
@@ -30,6 +30,8 @@ function extUserId(nameStr) {
 function participantLabel(p) {
   if (!p) return 'Unknown';
   if (p.user_id && String(p.user_id).startsWith('ext:')) return `**${p.display_name || p.user_tag || p.user_id.slice(4)}** (external)`;
+  const nick = p.display_name && p.display_name !== p.user_tag ? p.display_name : p.user_tag;
+  if (nick) return `**${String(nick).slice(0, 60)}** (<@${p.user_id}>)`;
   return `<@${p.user_id}>`;
 }
 
@@ -43,15 +45,42 @@ async function findParticipant(eventId, user, nameStr) {
   return null;
 }
 
+function parseStartTime(raw) {
+  const str = String(raw || '').trim();
+  if (!str) return null;
+  if (/^\d{10,13}$/.test(str)) { const n = Number(str); return n > 1e12 ? Math.floor(n / 1000) : n; }
+  const hm = str.match(/^(\d{1,2}):(\d{2})$/);
+  if (hm) {
+    const now = new Date();
+    const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), Number(hm[1]), Number(hm[2]), 0));
+    if (d.getTime() <= Date.now()) d.setUTCDate(d.getUTCDate() + 1);
+    return Math.floor(d.getTime() / 1000);
+  }
+  let t = Date.parse(str);
+  if (Number.isNaN(t)) t = Date.parse(str.replace(' ', 'T') + ':00Z');
+  if (Number.isNaN(t)) return null;
+  return Math.floor(t / 1000);
+}
+
+function startLabel(startsAt) {
+  if (!startsAt) return null;
+  return `<t:${startsAt}:F> (<t:${startsAt}:R>)`;
+}
+
 async function createEvent(interaction) {
   if (!interaction.guildId) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
   if (!canManageGuild(interaction)) return interaction.reply({ content: 'You need **Manage Events** (or Manage Server/Admin) to create events.', ephemeral: true });
   const nameVal = interaction.options.getString('name', true).trim().slice(0, 100);
   const desc = (interaction.options.getString('description') || '').trim().slice(0, 1000);
+  const rawStart = (interaction.options.getString('starts') || '').trim();
+  const startsAt = parseStartTime(rawStart);
+  if (rawStart && !startsAt) {
+    return interaction.reply({ content: 'Could not read the start time. Use `HH:MM` (UTC), `YYYY-MM-DD HH:MM`, ISO 8601, or unix seconds.', ephemeral: true });
+  }
   const now = Date.now();
   const res = await db.exec(
-    'INSERT INTO events (guild_id, name, description, host_id, host_tag, status, created_at) VALUES (?,?,?,?,?,?,?)',
-    [interaction.guildId, nameVal, desc || null, interaction.user.id, interaction.user.tag, 'OPEN', now]
+    'INSERT INTO events (guild_id, name, description, host_id, host_tag, status, created_at, starts_at) VALUES (?,?,?,?,?,?,?,?)',
+    [interaction.guildId, nameVal, desc || null, interaction.user.id, interaction.user.tag, 'OPEN', now, startsAt]
   );
   const id = res.lastInsertRowid ?? res?.lastInsertRowid;
   const e = base({ title: 'Event Created', description: `**${nameVal}**${desc ? `\n${desc}` : ''}`, color: theme.colors.success, mod: 'event' });
@@ -60,7 +89,8 @@ async function createEvent(interaction) {
     { name: 'Host', value: `<@${interaction.user.id}>`, inline: true },
     { name: 'Status', value: 'OPEN', inline: true }
   );
-  e.addFields({ name: 'Next steps', value: 'Add players with `/event add` (Discord user or external name), track scores with `/event score`, and view `/event leaderboard`.', inline: false });
+  if (startsAt) e.addFields({ name: 'Starts', value: startLabel(startsAt), inline: false });
+  e.addFields({ name: 'Next steps', value: 'Players press **Join Event** on the event overview, or add them with `/event add`. Track scores with `/event score`.', inline: false });
   await interaction.reply({ embeds: [e], components: joinLeaveRow({ id, status: 'OPEN' }) });
 }
 
@@ -71,7 +101,7 @@ async function listEvents(interaction) {
     [interaction.guildId]
   );
   if (!rows.length) return interaction.reply({ embeds: [base({ title: 'Events', description: 'No events yet. Create one with `/event create`.', color: theme.colors.neutral, mod: 'event' })], ephemeral: true });
-  const lines = rows.map(r => `**#${r.id}** ${r.status === 'OPEN' ? '🟢 OPEN' : '⚪ CLOSED'} — ${String(r.name).slice(0, 100)}\nHost: <@${r.host_id}> • Participants: ${Number(r.participant_count || 0)}${r.description ? `\n${String(r.description).slice(0, 80)}` : ''}`);
+  const lines = rows.map(r => `**#${r.id}** ${r.status === 'OPEN' ? '🟢 OPEN' : '⚪ CLOSED'} — ${String(r.name).slice(0, 100)}\nHost: <@${r.host_id}> • Participants: ${Number(r.participant_count || 0)}${r.starts_at ? ` • Starts <t:${r.starts_at}:R>` : ''}${r.description ? `\n${String(r.description).slice(0, 80)}` : ''}`);
   const e = base({ title: 'Server Events', description: lines.join('\n\n').slice(0, 4000), color: theme.colors.brand, mod: 'event' });
   e.addFields({ name: 'Open', value: String(rows.filter(r => r.status === 'OPEN').length), inline: true }, { name: 'Total', value: String(rows.length), inline: true });
   await interaction.reply({ embeds: [e] });
@@ -87,6 +117,7 @@ async function buildEventView(guildId, id) {
   const e = base({ title: `Event #${ev.id}: ${ev.name}`, description: ev.description ? String(ev.description).slice(0, 1500) : 'No description.', color: ev.status === 'OPEN' ? theme.colors.brand : theme.colors.neutral, mod: 'event' });
   e.addFields(
     { name: 'Status', value: ev.status, inline: true },
+    { name: 'Starts', value: ev.starts_at ? `<t:${ev.starts_at}:F>\n<t:${ev.starts_at}:R>` : 'Not set', inline: true },
     { name: 'Host', value: `<@${ev.host_id}>`, inline: true },
     { name: 'Participants', value: String(totalCount), inline: true },
     { name: 'Created', value: `<t:${Math.floor(ev.created_at / 1000)}:f>`, inline: true },
@@ -229,24 +260,37 @@ function joinLeaveRow(ev) {
   return [row];
 }
 
-async function joinEvent(interaction, id) {
-  if (!interaction.guildId) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+function nicknameModal(id, evName) {
+  const modal = new ModalBuilder().setCustomId(`evt_nj:${id}`).setTitle(`Join: ${String(evName).slice(0, 32)}`);
+  const input = new TextInputBuilder()
+    .setCustomId('nick')
+    .setLabel('Your in-game nickname')
+    .setPlaceholder('The name other players see in The Portal')
+    .setStyle(TextInputStyle.Short)
+    .setMinLength(1)
+    .setMaxLength(60)
+    .setRequired(true);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return modal;
+}
+
+async function joinWithNickname(interaction, id, rawNick) {
+  const nick = String(rawNick || "").replace(/\s+/g, " ").trim().slice(0, 60);
+  if (!nick) return interaction.reply({ content: 'Nickname cannot be empty.', ephemeral: true }).catch(() => {});
   const ev = await getEvent(id, interaction.guildId);
-  if (!ev) return interaction.reply({ content: `Event #${id} not found.`, ephemeral: true });
-  if (ev.status !== 'OPEN') return interaction.reply({ content: `**#${ev.id} ${ev.name}** is closed.`, ephemeral: true });
+  if (!ev) return interaction.reply({ content: `Event #${id} not found.`, ephemeral: true }).catch(() => {});
+  if (ev.status !== 'OPEN') return interaction.reply({ content: `**#${ev.id} ${ev.name}** is closed.`, ephemeral: true }).catch(() => {});
   const u = interaction.user;
-  const displayName = interaction.member?.displayName || u.globalName || u.username || u.tag;
   const existing = await db.get('SELECT * FROM event_participants WHERE event_id=? AND user_id=?', [id, u.id]);
   if (existing) {
-    const okDup = await refreshOverview(interaction, id);
-    const noteDup = { content: `You are already in **#${ev.id} ${ev.name}** (${existing.score} pts).`, ephemeral: true };
-    return okDup ? interaction.followUp(noteDup).catch(() => {}) : interaction.reply(noteDup).catch(() => {});
+    await db.exec('UPDATE event_participants SET display_name=? WHERE event_id=? AND user_id=?', [nick, id, u.id]).catch(() => {});
+  } else {
+    await db.exec('INSERT OR IGNORE INTO event_participants (event_id, user_id, user_tag, display_name, score, joined_at) VALUES (?,?,?,?,?,?)', [id, u.id, u.tag, nick, 0, Date.now()]).catch(() => {});
   }
-  await db.exec('INSERT OR IGNORE INTO event_participants (event_id, user_id, user_tag, display_name, score, joined_at) VALUES (?,?,?,?,?,?)', [id, u.id, u.tag, displayName, 0, Date.now()]);
-  const cnt = await db.get('SELECT COUNT(*) as c FROM event_participants WHERE event_id=?', [id]).catch(() => ({ c: 0 }));
-  const ok = await refreshOverview(interaction, id);
-  const note = { content: `Joined **#${ev.id} ${ev.name}** as ${displayName}. ${Number(cnt?.c || 0)} participant(s) now.`, ephemeral: true };
-  return ok ? interaction.followUp(note).catch(() => {}) : interaction.reply(note).catch(() => {});
+  const view = await buildEventView(interaction.guildId, id).catch(() => null);
+  await interaction.deferReply({ ephemeral: true }).catch(() => {});
+  if (view && interaction.message) await interaction.message.edit({ embeds: view.embeds, components: view.components }).catch(() => {});
+  return interaction.editReply({ content: `Joined **#${ev.id} ${ev.name}** as **${nick}**.` }).catch(() => {});
 }
 
 async function leaveEvent(interaction, id) {
@@ -273,7 +317,13 @@ function register(ctx) {
       const m = id.match(/^evt_([jl]):(\d+)$/);
       if (!m) return interaction.reply({ content: 'Unknown event control.', ephemeral: true }).catch(() => {});
       const eventId = parseInt(m[2], 10);
-      return m[1] === 'j' ? await joinEvent(interaction, eventId) : await leaveEvent(interaction, eventId);
+      if (m[1] === 'j') {
+        const ev = await getEvent(eventId, interaction.guildId);
+        if (!ev) return interaction.reply({ content: `Event #${eventId} not found.`, ephemeral: true }).catch(() => {});
+        if (ev.status !== 'OPEN') return interaction.reply({ content: `**#${ev.id} ${ev.name}** is closed.`, ephemeral: true }).catch(() => {});
+        return interaction.showModal(nicknameModal(eventId, ev.name));
+      }
+      return await leaveEvent(interaction, eventId);
     } catch (err) {
       logger.error('event', 'button_error', { err, id: interaction.customId });
       const msg = { content: 'Event action failed. Try again.', ephemeral: true };
@@ -282,6 +332,20 @@ function register(ctx) {
     }
   };
   buttons.name = name;
+  const onModal = async (interaction) => {
+    try {
+      const m = String(interaction.customId || '').match(/^evt_nj:(\d+)$/);
+      if (!m) return interaction.reply({ content: 'Unknown event control.', ephemeral: true }).catch(() => {});
+      return await joinWithNickname(interaction, parseInt(m[1], 10), interaction.fields.getTextInputValue('nick'));
+    } catch (err) {
+      logger.error('event', 'modal_error', { err, id: interaction.customId });
+      const msg = { content: 'Could not join the event. Try again.', ephemeral: true };
+      if (interaction.deferred || interaction.replied) return interaction.editReply(msg).catch(() => {});
+      return interaction.reply(msg).catch(() => {});
+    }
+  };
+  onModal.name = name;
+  ctx.router.registerPrefix('evt_nj:', onModal);
   ctx.router.registerPrefix('evt_', buttons);
 
   ctx.router.registerCommand('event', async (interaction) => {

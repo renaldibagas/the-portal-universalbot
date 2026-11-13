@@ -110,7 +110,8 @@ CREATE TABLE IF NOT EXISTS events (
   host_tag TEXT,
   status TEXT NOT NULL DEFAULT 'OPEN',
   created_at INTEGER NOT NULL,
-  closed_at INTEGER
+  closed_at INTEGER,
+  starts_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS event_participants (
   event_id INTEGER NOT NULL,
