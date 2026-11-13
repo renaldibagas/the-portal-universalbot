@@ -58,6 +58,36 @@ function stripFiles(s) {
   return String(s || '').replace(/\[\[(?:File|Image):[^\]]*\]\]/gi, '');
 }
 
+function mdEscape(v) {
+  return String(v || '').replace(/\|/g, '\\|').replace(/\s*\n+\s*/g, ' ').trim();
+}
+
+function chunkContent(text, limit = 1900) {
+  const lines = String(text || '').split('\n');
+  const isRow = (l) => /^\|.*\|\s*$/.test(l);
+  const isSep = (l) => /^\|[-:| ]+\|\s*$/.test(l);
+  const chunks = [];
+  let cur = [];
+  let curLen = 0;
+  let tableHeader = null;
+  let pendingHeader = null;
+  const flush = () => { if (cur.length) chunks.push(cur.join('\n')); cur = []; curLen = 0; };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isRow(line) && i + 1 < lines.length && isSep(lines[i + 1]) && !tableHeader) tableHeader = [line, lines[i + 1]];
+    const add = line.length + 1;
+    if (curLen + add > limit && cur.length) {
+      flush();
+      if (pendingHeader) { cur.push(pendingHeader[0], pendingHeader[1]); curLen += pendingHeader[0].length + pendingHeader[1].length + 2; }
+    }
+    cur.push(line);
+    curLen += add;
+    pendingHeader = isRow(line) && !isSep(line) && tableHeader && line !== tableHeader[0] ? tableHeader : null;
+  }
+  flush();
+  return chunks.filter(c => c.trim().length);
+}
+
 function convertTablesToText(text, maxRows = 12) {
   let s = String(text || '');
   // handle each wikitable block
@@ -101,18 +131,25 @@ function convertTablesToText(text, maxRows = 12) {
       else parsed.push(cells);
     }
     if (!parsed.length && !headers) return '';
+    const width = headers && headers.length ? headers.length : Math.max(...parsed.map(r => r.length));
+    const head = headers && headers.length ? headers : null;
+    if (head && head.length > 1) {
+      const cols = [];
+      for (let c = 0; c < width; c++) cols.push(mdEscape(head[c] || `Col ${c + 1}`));
+      const linesOut = ['| ' + cols.join(' | ') + ' |', '|' + cols.map(() => '---').join('|') + '|'];
+      for (let i = 0; i < parsed.length && i < maxRows; i++) {
+        const row = parsed[i];
+        const cells = [];
+        for (let c = 0; c < width; c++) cells.push(mdEscape(row[c] || ''));
+        linesOut.push('| ' + cells.join(' | ') + ' |');
+      }
+      if (parsed.length > maxRows) linesOut.push(`_…and ${parsed.length - maxRows} more rows_`);
+      return linesOut.join('\n');
+    }
     const linesOut = [];
     for (let i = 0; i < parsed.length && i < maxRows; i++) {
       const row = parsed[i];
-      if (headers && headers.length) {
-        const parts = row.map((c, idx) => {
-          const h = headers[idx] || headers[headers.length - 1] || `Col ${idx + 1}`;
-          return `**${h}:** ${c}`;
-        });
-        linesOut.push('• ' + parts.join(' | '));
-      } else {
-        linesOut.push('• ' + row.join(' — '));
-      }
+      linesOut.push('• ' + row.filter(Boolean).join(' — '));
     }
     if (parsed.length > maxRows) linesOut.push(`• …and ${parsed.length - maxRows} more`);
     return linesOut.join('\n');
@@ -243,7 +280,7 @@ function summarizeLead(wikitext, infoboxMatch) {
 }
 
 async function getPage(title) {
-  const key = 'page4:' + norm(title);
+  const key = 'page5:' + norm(title);
   const cached = await cacheGet(key); if (cached) return cached;
   try {
     const data = await api({ action: 'parse', page: title, prop: 'wikitext|sections|displaytitle', redirects: 1 });
@@ -452,31 +489,20 @@ async function buildSuggestions(query) {
   return { embeds: [e], components: rowsOut };
 }
 
-function chunkText(text, limit = 3900) {
-  const out = [];
-  let rest = String(text || '');
-  while (rest.length > limit) {
-    let cut = rest.lastIndexOf('\n', limit);
-    if (cut < limit * 0.5) cut = limit;
-    out.push(rest.slice(0, cut).trim());
-    rest = rest.slice(cut).trim();
-  }
-  if (rest) out.push(rest);
-  return out;
+function sectionHeaderEmbed(page, label, parts) {
+  const e = base({ title: `${page.title} — ${label}`, description: parts > 1 ? `_Part 1 of ${parts}_` : '', color: theme.colors.wiki, mod: 'wiki' });
+  if (page.imageUrl) e.setThumbnail(page.imageUrl);
+  if (page.url) e.setURL(page.url + '#' + encodeURIComponent(label.replace(/ /g, '_')));
+  return e;
 }
 
-function sectionEmbeds(page, sectionKey) {
+function sectionPayloads(page, sectionKey) {
   const details = page.detailSections || {};
   const text = details[sectionKey];
   const label = sectionKey.replace(/\b\w/g, c => c.toUpperCase());
-  const chunks = chunkText(text || 'No details available for this section.');
-  return chunks.slice(0, 10).map((chunk, i) => {
-    const title = chunks.length > 1 ? `${page.title} — ${label} (${i + 1}/${chunks.length})` : `${page.title} — ${label}`;
-    const e = base({ title, description: chunk, color: theme.colors.wiki, mod: 'wiki' });
-    if (i === 0 && page.imageUrl) e.setThumbnail(page.imageUrl);
-    if (page.url) e.setURL(page.url + '#' + encodeURIComponent(label.replace(/ /g, '_')));
-    return e;
-  });
+  const chunks = chunkContent(text || 'No details available for this section.');
+  if (!chunks.length) chunks.push('No details available for this section.');
+  return { chunks, label };
 }
 
 function register(ctx) {
@@ -502,7 +528,7 @@ function register(ctx) {
         if (!page) return interaction.editReply({ content: `Could not load "${title}".`, embeds: [], components: [] }).catch(() => {});
         const secKey = resolveSectionCode(code, page.detailSections || {});
         if (!secKey || !(page.detailSections || {})[secKey]) {
-          return interaction.editReply({ content: null, embeds: [itemEmbed(page, { compact: false })], components: detailButtons(page) }).catch(() => {});
+          return interaction.editReply({ content: null, embeds: [itemEmbed(page, { compact: true })], components: detailButtons(page) }).catch(() => {});
         }
         const tEnc = encodeTitle(page.title);
         const rows = detailButtons(page);
@@ -515,7 +541,13 @@ function register(ctx) {
         } else {
           navRow = new ActionRowBuilder().addComponents(overviewBtn);
         }
-        return interaction.editReply({ content: null, embeds: sectionEmbeds(page, secKey), components: [navRow] }).catch(() => {});
+        const { chunks, label } = sectionPayloads(page, secKey);
+        const header = sectionHeaderEmbed(page, label, chunks.length);
+        await interaction.editReply({ content: chunks[0], embeds: [header], components: [navRow] }).catch(() => {});
+        for (let i = 1; i < chunks.length; i++) {
+          await interaction.followUp({ content: chunks[i], embeds: [], components: [], allowedMentions: { parse: [] } }).catch(() => {});
+        }
+        return;
       }
       if (interaction.isButton() && interaction.customId.startsWith('wk_o:')) {
         const title = decodeTitle(interaction.customId.slice(5));
