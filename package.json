@@ -1,0 +1,23 @@
+{
+  "name": "the-portal-universalbot",
+  "version": "1.0.0",
+  "description": "Unified Discord bot for The Portal (auction, stock, weather/BMKG, wiki)",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "deploy-commands": "node src/scripts/deploy-commands.js",
+    "migrate:legacy-auctions": "node src/scripts/migrate-legacy-auctions.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "better-sqlite3": "^11.8.1",
+    "discord.js": "^14.17.3",
+    "dotenv": "^16.4.7"
+  }
+}

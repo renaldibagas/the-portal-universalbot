@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+*.log
+npm-debug.log*
+.DS_Store
+
+# windows device-name artifact
+nul
+
+.arena/
+bmkg_full_game_dump*
