@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS event_participants (
   event_id INTEGER NOT NULL,
   user_id TEXT NOT NULL,
   user_tag TEXT,
+  display_name TEXT,
   score INTEGER NOT NULL DEFAULT 0,
   joined_at INTEGER NOT NULL,
   PRIMARY KEY (event_id, user_id),
