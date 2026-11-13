@@ -1,4 +1,4 @@
-const { PermissionFlagsBits } = require('discord.js');
+const { PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const db = require('../../db');
 const logger = require('../../core/logger');
 const { base } = require('../../ui/embeds');
@@ -61,40 +61,53 @@ async function createEvent(interaction) {
     { name: 'Status', value: 'OPEN', inline: true }
   );
   e.addFields({ name: 'Next steps', value: 'Add players with `/event add` (Discord user or external name), track scores with `/event score`, and view `/event leaderboard`.', inline: false });
-  await interaction.reply({ embeds: [e] });
+  await interaction.reply({ embeds: [e], components: joinLeaveRow({ id, status: 'OPEN' }) });
 }
 
 async function listEvents(interaction) {
   if (!interaction.guildId) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
-  const rows = await db.all('SELECT * FROM events WHERE guild_id = ? ORDER BY (status = "OPEN") DESC, created_at DESC LIMIT 25', [interaction.guildId]);
+  const rows = await db.all(
+    "SELECT e.*, (SELECT COUNT(*) FROM event_participants p WHERE p.event_id = e.id) AS participant_count FROM events e WHERE e.guild_id = ? ORDER BY (e.status = 'OPEN') DESC, e.created_at DESC LIMIT 25",
+    [interaction.guildId]
+  );
   if (!rows.length) return interaction.reply({ embeds: [base({ title: 'Events', description: 'No events yet. Create one with `/event create`.', color: theme.colors.neutral, mod: 'event' })], ephemeral: true });
-  const lines = [];
-  for (const r of rows) {
-    const cnt = await db.get('SELECT COUNT(*) as c FROM event_participants WHERE event_id=?', [r.id]).catch(() => ({ c: 0 }));
-    lines.push(`**#${r.id}** ${r.status === 'OPEN' ? '🟢 OPEN' : '⚪ CLOSED'} — ${r.name}\nHost: <@${r.host_id}> • Participants: ${cnt?.c || 0}${r.description ? `\n${String(r.description).slice(0, 80)}` : ''}`);
-  }
+  const lines = rows.map(r => `**#${r.id}** ${r.status === 'OPEN' ? '🟢 OPEN' : '⚪ CLOSED'} — ${String(r.name).slice(0, 100)}\nHost: <@${r.host_id}> • Participants: ${Number(r.participant_count || 0)}${r.description ? `\n${String(r.description).slice(0, 80)}` : ''}`);
   const e = base({ title: 'Server Events', description: lines.join('\n\n').slice(0, 4000), color: theme.colors.brand, mod: 'event' });
+  e.addFields({ name: 'Open', value: String(rows.filter(r => r.status === 'OPEN').length), inline: true }, { name: 'Total', value: String(rows.length), inline: true });
   await interaction.reply({ embeds: [e] });
+}
+
+async function buildEventView(guildId, id) {
+  const ev = await getEvent(id, guildId);
+  if (!ev) return null;
+  const parts = await db.all('SELECT * FROM event_participants WHERE event_id = ? ORDER BY score DESC, joined_at ASC LIMIT 30', [id]);
+  const total = await db.get('SELECT COUNT(*) as c FROM event_participants WHERE event_id = ?', [id]);
+  const totalCount = Number(total?.c || 0);
+  const pLines = parts.length ? parts.map((p, i) => `${i + 1}. ${participantLabel(p)} \u2014 **${p.score}** pts`).join('\n') : 'No participants yet. Press **Join Event** to enter.';
+  const e = base({ title: `Event #${ev.id}: ${ev.name}`, description: ev.description ? String(ev.description).slice(0, 1500) : 'No description.', color: ev.status === 'OPEN' ? theme.colors.brand : theme.colors.neutral, mod: 'event' });
+  e.addFields(
+    { name: 'Status', value: ev.status, inline: true },
+    { name: 'Host', value: `<@${ev.host_id}>`, inline: true },
+    { name: 'Participants', value: String(totalCount), inline: true },
+    { name: 'Created', value: `<t:${Math.floor(ev.created_at / 1000)}:f>`, inline: true },
+    { name: 'Closed', value: ev.closed_at ? `<t:${Math.floor(ev.closed_at / 1000)}:f>` : '\u2014', inline: true },
+    { name: `Participants list (${parts.length}${totalCount > parts.length ? ` of ${totalCount}` : ''})`, value: pLines.slice(0, 1024), inline: false }
+  );
+  return { ev, embeds: [e], components: joinLeaveRow(ev) };
+}
+
+async function refreshOverview(interaction, id) {
+  const view = await buildEventView(interaction.guildId, id).catch(() => null);
+  if (!view) return false;
+  try { await interaction.update({ embeds: view.embeds, components: view.components }); return true; } catch { return false; }
 }
 
 async function infoEvent(interaction) {
   if (!interaction.guildId) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
   const id = interaction.options.getInteger('id', true);
-  const ev = await getEvent(id, interaction.guildId);
-  if (!ev) return interaction.reply({ content: `Event #${id} not found in this server.`, ephemeral: true });
-  const parts = await db.all('SELECT * FROM event_participants WHERE event_id = ? ORDER BY score DESC, joined_at ASC LIMIT 30', [id]);
-  const total = await db.get('SELECT COUNT(*) as c FROM event_participants WHERE event_id = ?', [id]);
-  const pLines = parts.length ? parts.map((p, i) => `${i + 1}. ${participantLabel(p)} — **${p.score}** pts`).join('\n') : 'No participants yet.';
-  const e = base({ title: `Event #${ev.id}: ${ev.name}`, description: ev.description ? String(ev.description).slice(0, 1500) : 'No description.', color: ev.status === 'OPEN' ? theme.colors.brand : theme.colors.neutral, mod: 'event' });
-  e.addFields(
-    { name: 'Status', value: ev.status, inline: true },
-    { name: 'Host', value: `<@${ev.host_id}>`, inline: true },
-    { name: 'Participants', value: String(total?.c || 0), inline: true },
-    { name: 'Created', value: `<t:${Math.floor(ev.created_at / 1000)}:f>`, inline: true },
-    { name: 'Closed', value: ev.closed_at ? `<t:${Math.floor(ev.closed_at / 1000)}:f>` : '—', inline: true },
-    { name: `Top participants (${parts.length}${(total?.c || 0) > parts.length ? ` of ${total.c}` : ''})`, value: pLines.slice(0, 1024), inline: false }
-  );
-  await interaction.reply({ embeds: [e] });
+  const view = await buildEventView(interaction.guildId, id);
+  if (!view) return interaction.reply({ content: `Event #${id} not found in this server.`, ephemeral: true });
+  await interaction.reply({ embeds: view.embeds, components: view.components });
 }
 
 async function addParticipant(interaction) {
@@ -207,9 +220,72 @@ async function closeEvent(interaction) {
   await interaction.reply({ content: `Closed event **#${id} ${ev.name}**.` });
 }
 
+function joinLeaveRow(ev) {
+  const open = ev.status === 'OPEN';
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`evt_j:${ev.id}`).setLabel('Join Event').setStyle(ButtonStyle.Success).setDisabled(!open),
+    new ButtonBuilder().setCustomId(`evt_l:${ev.id}`).setLabel('Leave Event').setStyle(ButtonStyle.Danger).setDisabled(!open)
+  );
+  return [row];
+}
+
+async function joinEvent(interaction, id) {
+  if (!interaction.guildId) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+  const ev = await getEvent(id, interaction.guildId);
+  if (!ev) return interaction.reply({ content: `Event #${id} not found.`, ephemeral: true });
+  if (ev.status !== 'OPEN') return interaction.reply({ content: `**#${ev.id} ${ev.name}** is closed.`, ephemeral: true });
+  const u = interaction.user;
+  const displayName = interaction.member?.displayName || u.globalName || u.username || u.tag;
+  const existing = await db.get('SELECT * FROM event_participants WHERE event_id=? AND user_id=?', [id, u.id]);
+  if (existing) {
+    const okDup = await refreshOverview(interaction, id);
+    const noteDup = { content: `You are already in **#${ev.id} ${ev.name}** (${existing.score} pts).`, ephemeral: true };
+    return okDup ? interaction.followUp(noteDup).catch(() => {}) : interaction.reply(noteDup).catch(() => {});
+  }
+  await db.exec('INSERT OR IGNORE INTO event_participants (event_id, user_id, user_tag, display_name, score, joined_at) VALUES (?,?,?,?,?,?)', [id, u.id, u.tag, displayName, 0, Date.now()]);
+  const cnt = await db.get('SELECT COUNT(*) as c FROM event_participants WHERE event_id=?', [id]).catch(() => ({ c: 0 }));
+  const ok = await refreshOverview(interaction, id);
+  const note = { content: `Joined **#${ev.id} ${ev.name}** as ${displayName}. ${Number(cnt?.c || 0)} participant(s) now.`, ephemeral: true };
+  return ok ? interaction.followUp(note).catch(() => {}) : interaction.reply(note).catch(() => {});
+}
+
+async function leaveEvent(interaction, id) {
+  if (!interaction.guildId) return interaction.reply({ content: 'Use this in a server.', ephemeral: true });
+  const ev = await getEvent(id, interaction.guildId);
+  if (!ev) return interaction.reply({ content: `Event #${id} not found.`, ephemeral: true });
+  const u = interaction.user;
+  const existing = await db.get('SELECT * FROM event_participants WHERE event_id=? AND user_id=?', [id, u.id]);
+  if (!existing) {
+    const okMissing = await refreshOverview(interaction, id);
+    const noteMissing = { content: `You are not in **#${ev.id} ${ev.name}**.`, ephemeral: true };
+    return okMissing ? interaction.followUp(noteMissing).catch(() => {}) : interaction.reply(noteMissing).catch(() => {});
+  }
+  await db.exec('DELETE FROM event_participants WHERE event_id=? AND user_id=?', [id, u.id]);
+  const ok = await refreshOverview(interaction, id);
+  const note = { content: `Left **#${ev.id} ${ev.name}**.`, ephemeral: true };
+  return ok ? interaction.followUp(note).catch(() => {}) : interaction.reply(note).catch(() => {});
+}
+
 function register(ctx) {
+  const buttons = async (interaction) => {
+    try {
+      const id = interaction.customId || '';
+      const m = id.match(/^evt_([jl]):(\d+)$/);
+      if (!m) return interaction.reply({ content: 'Unknown event control.', ephemeral: true }).catch(() => {});
+      const eventId = parseInt(m[2], 10);
+      return m[1] === 'j' ? await joinEvent(interaction, eventId) : await leaveEvent(interaction, eventId);
+    } catch (err) {
+      logger.error('event', 'button_error', { err, id: interaction.customId });
+      const msg = { content: 'Event action failed. Try again.', ephemeral: true };
+      if (interaction.deferred || interaction.replied) return interaction.editReply(msg).catch(() => {});
+      return interaction.reply(msg).catch(() => {});
+    }
+  };
+  buttons.name = name;
+  ctx.router.registerPrefix('evt_', buttons);
+
   ctx.router.registerCommand('event', async (interaction) => {
-    const sub = interaction.options.getSubcommand();
+    const sub = interaction.options.getSubcommand(false) || 'list';
     try {
       switch (sub) {
         case 'create': return await createEvent(interaction);
