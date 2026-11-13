@@ -86,6 +86,14 @@ function convertTablesToText(text, maxRows = 12) {
           if (attrMatch) val = attrMatch[1];
           const cellText = cleanCell(val);
           if (cellText) cells.push(cellText);
+          else cells.push('');
+        } else if (cells.length) {
+          // continuation of the previous cell (bullet/numbered list content)
+          const extra = cleanCell(l.replace(/^[*#:;]+\s*/, ''));
+          if (extra) {
+            const prev = cells[cells.length - 1];
+            cells[cells.length - 1] = prev ? prev + ', ' + extra : extra;
+          }
         }
       }
       if (!cells.length) continue;
@@ -235,7 +243,7 @@ function summarizeLead(wikitext, infoboxMatch) {
 }
 
 async function getPage(title) {
-  const key = 'page3:' + norm(title);
+  const key = 'page4:' + norm(title);
   const cached = await cacheGet(key); if (cached) return cached;
   try {
     const data = await api({ action: 'parse', page: title, prop: 'wikitext|sections|displaytitle', redirects: 1 });
