@@ -422,19 +422,26 @@ function detailButtons(page) {
 async function buildSuggestions(query) {
   const results = await suggest(query, 8);
   if (!results.length) return null;
+  const q = norm(query);
+  const score = (t) => { const n = norm(t); return n === q ? 0 : n.startsWith(q) ? 1 : 2; };
+  const ranked = [...results].sort((a, b) => score(a.title) - score(b.title));
   const row = new ActionRowBuilder();
-  const ranked = [...results].sort((a, b) => {
-    const q = norm(query);
-    const score = (t) => { const n = norm(t); return n === q ? 0 : n.startsWith(q) ? 1 : 2; };
-    return score(a.title) - score(b.title);
-  });
-  for (const r of ranked.slice(0, 5)) {
+  const top = ranked.slice(0, 10);
+  for (const r of top) {
+    if (row.components.length === 5) break;
     row.addComponents(new ButtonBuilder().setCustomId('wk_p:' + encodeTitle(r.title)).setLabel(String(r.title).slice(0, 80)).setStyle(ButtonStyle.Secondary));
+  }
+  const extra = top.slice(5);
+  const rowsOut = [row];
+  if (extra.length) {
+    const row2 = new ActionRowBuilder();
+    for (const r of extra) row2.addComponents(new ButtonBuilder().setCustomId('wk_p:' + encodeTitle(r.title)).setLabel(String(r.title).slice(0, 80)).setStyle(ButtonStyle.Secondary));
+    rowsOut.push(row2);
   }
   const e = base({ title: 'Which page do you want?', description: `No page is titled exactly **"${String(query).slice(0, 150)}"**. Pick one of these matches:`, color: theme.colors.wiki, mod: 'wiki' });
   const list = ranked.map((r, i) => `${i + 1}. **${r.title}**${r.snippet ? ` — ${r.snippet.slice(0, 120)}` : ''}`).join('\n');
   e.addFields({ name: 'Matches', value: list.slice(0, 1024), inline: false });
-  return { embeds: [e], components: [row] };
+  return { embeds: [e], components: rowsOut };
 }
 
 function chunkText(text, limit = 3900) {
