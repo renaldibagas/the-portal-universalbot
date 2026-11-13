@@ -32,8 +32,8 @@ async function init() {
     }
     const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
     await execScript(schema);
-    // best-effort legacy compat
-    await exec("ALTER TABLE auctions ADD COLUMN scope TEXT DEFAULT 'PUBLIC'").catch(() => null);
+    // best-effort legacy compat (use direct execution; init() is in progress)
+    await execDirect("ALTER TABLE auctions ADD COLUMN scope TEXT DEFAULT 'PUBLIC'").catch(() => null);
     await execScript(`CREATE TABLE IF NOT EXISTS stock_target_roles (
   guild_id TEXT NOT NULL,
   target_norm TEXT NOT NULL,
@@ -54,10 +54,14 @@ function prepare(sql) {
   return stmt;
 }
 
-async function exec(sql, args = []) {
-  await init();
+async function execDirect(sql, args = []) {
   if (isTurso) return turso.execute({ sql, args });
   return prepare(sql).run(...args);
+}
+
+async function exec(sql, args = []) {
+  await init();
+  return execDirect(sql, args);
 }
 async function get(sql, args = []) {
   await init();
