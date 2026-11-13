@@ -24,7 +24,7 @@ function now() { return Date.now(); }
 function norm(s) { return String(s || '').trim().toLowerCase(); }
 
 async function cacheGet(key) {
-  const row = await db.get('SELECT * FROM wiki_cache WHERE key=?', [key]);
+  const row = await db.get('SELECT * FROM wiki_cache WHERE key=?', [key]).catch(() => null);
   if (!row) return null;
   if (row.expires_at < now()) return null;
   await db.exec('UPDATE wiki_cache SET hits=hits+1 WHERE key=?', [key]).catch(() => {});
@@ -33,82 +33,220 @@ async function cacheGet(key) {
 async function cacheSet(key, payload, ttlMs, title = null, pageId = null) {
   const ts = now();
   await db.exec('INSERT OR REPLACE INTO wiki_cache(key,page_id,title,payload,fetched_at,expires_at,hits) VALUES(?,?,?,?,?,?,COALESCE((SELECT hits FROM wiki_cache WHERE key=?),0))',
-    [key, pageId, title, JSON.stringify(payload), ts, ts + ttlMs, key]);
+    [key, pageId, title, JSON.stringify(payload), ts, ts + ttlMs, key]).catch(() => {});
 }
 async function negGet(key) {
-  const row = await db.get('SELECT * FROM wiki_negative WHERE key=?', [key]);
+  const row = await db.get('SELECT * FROM wiki_negative WHERE key=?', [key]).catch(() => null);
   return row && row.expires_at >= now();
 }
 async function negSet(key) {
-  await db.exec('INSERT OR REPLACE INTO wiki_negative(key,expires_at) VALUES(?,?)', [key, now() + config.wikiNegativeTtlMin * 60 * 1000]);
+  await db.exec('INSERT OR REPLACE INTO wiki_negative(key,expires_at) VALUES(?,?)', [key, now() + (config.wikiNegativeTtlMin || 60) * 60 * 1000]).catch(() => {});
 }
 
 async function search(query, limit = 8) {
-  const key = 'search:' + norm(query) + ':' + limit;
+  const key = 'search2:' + norm(query) + ':' + limit;
   const cached = await cacheGet(key); if (cached) return cached;
   try {
     const data = await api({ action: 'query', list: 'search', srsearch: query, srlimit: limit, srnamespace: 0 });
     const res = (data?.query?.search || []).map(s => ({ title: s.title, snippet: (s.snippet || '').replace(/<[^>]+>/g, '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim(), pageid: s.pageid }));
-    if (!res.length) await negSet('searchneg:' + norm(query)); else await cacheSet(key, res, 24 * 3600 * 1000);
+    if (res.length) await cacheSet(key, res, 24 * 3600 * 1000); else await negSet('sneg:' + norm(query));
     return res;
   } catch (e) { logger.warn('wiki', 'search_error', { err: e, query }); return cached || []; }
 }
 
-function cleanWikiText(v) {
-  return String(v || '')
-    .replace(/\[\[File:[^\]]+\]\]/gi, '')
-    .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2')
-    .replace(/\[\[([^\]]+)\]\]/g, '$1')
-    .replace(/\{\{[^{}]*\}\}/g, '')
-    .replace(/<br\s*\/?\s*>/gi, '\n')
-    .replace(/<ref[^>]*>[\s\S]*?<\/ref>/gi, '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/'{2,}/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+function stripFiles(s) {
+  return String(s || '').replace(/\[\[(?:File|Image):[^\]]*\]\]/gi, '');
 }
 
-function parseInfobox(wikitext) {
-  if (!wikitext) return { fields: {}, description: '', image: null };
-  const m = wikitext.match(/\{\|\s*class="[^"]*wikitable[^"]*"[\s\S]*?\n\|\}/i) || wikitext.match(/\{\|[\s\S]*?\n\|\}/i);
-  const fields = {}; let image = null;
-  if (m) {
-    const rows = m[0].split(/\n\|-/);
-    for (const row of rows) {
-      const km = row.match(/!\s*([^|\n]+?)\s*(?:\||\n)/);
-      const vm = row.match(/\n\|\s*([\s\S]*)$/);
-      if (!km) continue;
-      const key = cleanWikiText(km[1].replace(/style="[^"]*"/gi, '').replace(/colspan="[^"]*"/gi, '').replace(/rowspan="[^"]*"/gi, '')).toLowerCase();
-      let rawVal = (vm ? vm[1] : '').trim();
-      const img = rawVal.match(/\[\[File:([^\]|]+)/i);
-      if (img && !image) image = img[1].trim();
-      const val = cleanWikiText(rawVal).slice(0, 1000);
-      if (key && val) {
-        // keep first or append if duplicate key
-        if (!fields[key]) fields[key] = val; else if (!fields[key].includes(val)) fields[key] = (fields[key] + '\n' + val).slice(0, 1000);
+function convertTablesToText(text) {
+  let s = String(text || '');
+  // handle each wikitable block
+  s = s.replace(/\{\|[\s\S]*?\|\}/g, (table) => {
+    const rows = table.split(/\n\|-/).map(r => r.trim()).filter(Boolean);
+    const parsed = [];
+    let headers = null;
+    for (let row of rows) {
+      if (/^\{\|/.test(row)) row = row.replace(/^\{\|[^\n]*\n?/, '');
+      if (/^\|\}/.test(row)) continue;
+      const cells = [];
+      const lines = row.split('\n');
+      let isHeaderRow = false;
+      for (const line of lines) {
+        const l = line.trim();
+        if (!l || /^\{\|/.test(l) || /^\|\}/.test(l)) continue;
+        if (/^!/.test(l)) {
+          isHeaderRow = true;
+          const parts = l.replace(/^!+/, '').split(/!!|\|/);
+          const cellText = cleanCell(parts[parts.length - 1] || '');
+          if (cellText) cells.push(cellText);
+        } else if (/^\|/.test(l)) {
+          const raw = l.replace(/^\|+/, '');
+          let val = raw;
+          const attrMatch = raw.match(/^\s*(?:style|colspan|rowspan|class|align)="[^"]*"\s*\|\s*([\s\S]*)$/i);
+          if (attrMatch) val = attrMatch[1];
+          const cellText = cleanCell(val);
+          if (cellText) cells.push(cellText);
+        }
+      }
+      if (!cells.length) continue;
+      if (isHeaderRow && !headers) headers = cells;
+      else parsed.push(cells);
+    }
+    if (!parsed.length && !headers) return '';
+    const linesOut = [];
+    const maxRows = 12;
+    for (let i = 0; i < parsed.length && i < maxRows; i++) {
+      const row = parsed[i];
+      if (headers && headers.length) {
+        const parts = row.map((c, idx) => {
+          const h = headers[idx] || headers[headers.length - 1] || `Col ${idx + 1}`;
+          return `**${h}:** ${c}`;
+        });
+        linesOut.push('• ' + parts.join(' | '));
+      } else {
+        linesOut.push('• ' + row.join(' — '));
       }
     }
+    if (parsed.length > maxRows) linesOut.push(`• …and ${parsed.length - maxRows} more`);
+    return linesOut.join('\n');
+  });
+  return s;
+}
+
+function cleanWikiText(v) {
+  let s = String(v || '');
+  s = convertTablesToText(s);
+  s = stripFiles(s);
+  s = s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2');
+  s = s.replace(/\[\[([^\]]+)\]\]/g, '$1');
+  s = s.replace(/\{\{[^{}]*\}\}/g, '');
+  s = s.replace(/<br\s*\/?\s*>/gi, '\n');
+  s = s.replace(/<ref[^>]*>[\s\S]*?<\/ref>/gi, '');
+  s = s.replace(/<ref[^>]*\/>/gi, '');
+  s = s.replace(/<[^>]+>/g, '');
+  s = s.replace(/^----+\s*$/gm, '');
+  s = s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  s = s.replace(/'{2,}/g, '');
+  s = s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+  return s;
+}
+
+function cleanCell(raw) {
+  let s = String(raw || '');
+  s = s.replace(/<br\s*\/?\s*>/gi, '\n');
+  s = stripFiles(s);
+  s = s.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, '$2');
+  s = s.replace(/\[\[([^\]]+)\]\]/g, '$1');
+  s = s.replace(/<ref[^>]*>[\s\S]*?<\/ref>/gi, '').replace(/<ref[^>]*\/>/gi, '');
+  s = s.replace(/<[^>]+>/g, '');
+  s = s.replace(/\{\{[^{}]*\}\}/g, '');
+  s = s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  s = s.replace(/'{2,}/g, '');
+  return s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function pickMainImageFromInfobox(boxText) {
+  const files = [];
+  const re = /\[\[File:([^\]|#]+)(?:[^\]]*)\]\]/gi;
+  let m;
+  while ((m = re.exec(boxText))) files.push({ name: m[1].trim(), raw: m[0], idx: m.index });
+  if (!files.length) return null;
+  const scored = files.map((f, i) => {
+    let score = 0;
+    if (/icon|tria|coin|gold|silver/i.test(f.name)) score -= 6;
+    if (/px/.test(f.raw)) {
+      const pm = f.raw.match(/(\d+)\s*px/i);
+      if (pm) {
+        const px = parseInt(pm[1], 10);
+        score += Math.min(6, px / 40);
+        if (px <= 32) score -= 5;
+      }
+    } else {
+      score += 3;
+    }
+    if (i === 0) score += 2;
+    return { ...f, score };
+  });
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0].name;
+}
+
+function parseInfoboxTable(boxText) {
+  const fields = {};
+  if (!boxText) return { fields, image: null };
+  const image = pickMainImageFromInfobox(boxText);
+  const rows = boxText.split(/\n\|-/);
+  for (const row of rows) {
+    const lines = row.split('\n').map(l => l.replace(/\r$/, ''));
+    let key = null;
+    let value = null;
+    for (const line of lines) {
+      if (/^\|\}/.test(line.trim())) continue;
+      if (/^!/.test(line)) {
+        const parts = line.replace(/^!/, '').split('|');
+        key = cleanCell(parts[parts.length - 1] || '');
+      } else if (/^\|/.test(line)) {
+        const raw = line.replace(/^\|/, '');
+        let valRaw = raw;
+        const attrMatch = raw.match(/^\s*(?:style|colspan|rowspan|class|align)="[^"]*"\s*\|\s*([\s\S]*)$/i);
+        if (attrMatch) valRaw = attrMatch[1];
+        const cleaned = cleanCell(valRaw);
+        if (cleaned) value = value ? (value + '\n' + cleaned) : cleaned;
+      }
+    }
+    if (key && value) {
+      const k = norm(key);
+      if (!k || k.length > 60) continue;
+      if (!fields[k]) fields[k] = value.slice(0, 1200);
+      else if (!fields[k].includes(value)) fields[k] = (fields[k] + '\n' + value).slice(0, 1200);
+    }
   }
-  let desc = wikitext;
-  if (m) desc = desc.replace(m[0], '');
-  desc = desc.replace(/\{\{[^{}]*\}\}/g, '').replace(/__\w+__/g, '');
-  const paras = desc.split(/\n\n+/).map(p => cleanWikiText(p)).filter(p => p.length > 25 && !/^=+/.test(p));
-  const description = (paras.slice(0, 3).join('\n\n') || cleanWikiText(desc)).slice(0, 2000);
-  return { fields, description, image };
+  return { fields, image };
+}
+
+function extractSections(wikitext) {
+  const text = String(wikitext || '');
+  const re = /^==+\s*([^=]+?)\s*==+\s*$/gm;
+  const matches = [];
+  let m;
+  while ((m = re.exec(text))) matches.push({ title: m[1].trim(), index: m.index, start: m.index + m[0].length });
+  const out = {};
+  for (let i = 0; i < matches.length; i++) {
+    const cur = matches[i];
+    const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
+    const body = text.slice(cur.start, end).trim();
+    out[norm(cur.title)] = { title: cur.title, raw: body, text: cleanWikiText(body).slice(0, 3500) };
+  }
+  return out;
+}
+
+function summarizeLead(wikitext, infoboxMatch) {
+  let s = String(wikitext || '');
+  if (infoboxMatch) s = s.replace(infoboxMatch, '');
+  s = s.replace(/\{\{DISPLAYTITLE:[^}]+\}\}/gi, '');
+  s = s.replace(/^----+\s*$/gm, '');
+  const secIdx = s.search(/^==+\s*[^=]+?\s*==+\s*$/m);
+  if (secIdx >= 0) s = s.slice(0, secIdx);
+  const cleaned = cleanWikiText(s);
+  const paras = cleaned.split(/\n\n+/).map(p => p.trim()).filter(p => p.length > 8);
+  return paras.slice(0, 2).join('\n\n').slice(0, 1200);
 }
 
 async function getPage(title) {
-  const key = 'page:' + norm(title);
+  const key = 'page2:' + norm(title);
   const cached = await cacheGet(key); if (cached) return cached;
   try {
-    const data = await api({ action: 'parse', page: title, prop: 'wikitext|displaytitle|sections', redirects: 1 });
-    if (data?.error) { await negSet(key); return null; }
+    const data = await api({ action: 'parse', page: title, prop: 'wikitext|sections|displaytitle', redirects: 1 });
+    if (data?.error) { await negSet('pneg:' + norm(title)); return null; }
     const parse = data.parse || {};
     const wt = typeof parse.wikitext === 'string' ? parse.wikitext : (parse.wikitext?.['*'] || '');
-    const info = parseInfobox(wt);
+    const box = wt.match(/\{\|\s*class="[^"]*wikitable[^"]*"[\s\S]*?\n\|\}/i) || wt.match(/\{\|[\s\S]*?\n\|\}/i);
+    const info = box ? parseInfoboxTable(box[0]) : { fields: {}, image: null };
+    const sections = extractSections(wt);
+    const lead = summarizeLead(wt, box ? box[0] : null);
+    const descSection = sections['description']?.text || '';
+    const description = (lead + (lead && descSection ? '\n\n' : '') + descSection).trim().slice(0, 1800) || 'No description available.';
+
     let imageUrl = null;
     if (info.image) {
       try {
@@ -117,10 +255,29 @@ async function getPage(title) {
         imageUrl = pages[0]?.imageinfo?.[0]?.url || null;
       } catch {}
     }
-    // gather section headings for extra context
-    const sections = (parse.sections || []).map(s => s.line).filter(Boolean).slice(0, 12);
-    const res = { title: parse.title || title, pageid: parse.pageid, fields: info.fields, description: info.description, imageUrl, sections, url: `https://roblox-the-portal.fandom.com/wiki/${encodeURIComponent((parse.title || title).replace(/ /g, '_'))}` };
-    await cacheSet(key, res, config.wikiTtlHours * 3600 * 1000, res.title, res.pageid);
+
+    const sectionList = (parse.sections || []).map(s => s.line).filter(Boolean).slice(0, 15);
+    const detailSections = {};
+    const preferred = ['how to obtain', 'used in', 'stats', 'effects', 'notes', 'trivia', 'recipe', 'recipes', 'crafting', 'upgrade', 'upgrades', 'drops'];
+    for (const keyName of preferred) {
+      if (sections[keyName]?.text) detailSections[keyName] = sections[keyName].text.slice(0, 3500);
+    }
+    for (const [k, v] of Object.entries(sections)) {
+      if (detailSections[k]) continue;
+      if (v.text && v.text.length > 20) detailSections[k] = v.text.slice(0, 2500);
+    }
+
+    const res = {
+      title: parse.title || title,
+      pageid: parse.pageid,
+      fields: info.fields,
+      description,
+      imageUrl,
+      sections: sectionList,
+      detailSections,
+      url: `https://roblox-the-portal.fandom.com/wiki/${encodeURIComponent((parse.title || title).replace(/ /g, '_'))}`
+    };
+    await cacheSet(key, res, (config.wikiTtlHours || 168) * 3600 * 1000, res.title, res.pageid);
     return res;
   } catch (e) { logger.warn('wiki', 'page_error', { err: e, title }); return null; }
 }
@@ -135,7 +292,7 @@ async function resolve(query) {
     results = await search(words.slice(0, -1).join(' '), 5);
     if (results.length) { page = await getPage(results[0].title); if (page) return page; }
   }
-  if (words[0] && words[0] !== query) {
+  if (words[0] && norm(words[0]) !== norm(query)) {
     results = await search(words[0], 5);
     if (results.length) { page = await getPage(results[0].title); if (page) return page; }
   }
@@ -153,88 +310,197 @@ async function suggest(query, limit = 5) {
   return out.slice(0, limit);
 }
 
-function itemEmbed(page) {
-  const e = base({ title: page.title, description: (page.description || 'No description available.').slice(0, 2000), color: theme.colors.wiki, mod: 'wiki' });
-  const f = page.fields || {};
-  const used = new Set();
-  const pick = (keys) => {
-    for (const k of keys) { const key = k.toLowerCase(); if (f[key]) { used.add(key); return [key, f[key]]; } }
-    return null;
-  };
-  const rows = [
-    ['Category', pick(['category', 'type', 'item type'])?.[1]],
-    ['Tier', pick(['tier'])?.[1]],
-    ['Rarity', pick(['rarity'])?.[1]],
-    ['Slot', pick(['slot', 'equipment slot'])?.[1]],
-    ['Buy', pick(['buy price', 'buy', 'price'])?.[1]],
-    ['Sell', pick(['sell price', 'sell'])?.[1]],
-    ['Level', pick(['level', 'level requirement', 'required level', 'req level'])?.[1]],
-    ['Damage', pick(['damage', 'attack'])?.[1]],
-    ['Defense', pick(['defense', 'defence', 'armor', 'armour'])?.[1]],
-  ].filter(([, v]) => v);
-  for (const [n, v] of rows.slice(0, 8)) e.addFields({ name: n, value: String(v).slice(0, 300), inline: true });
-
-  const obtain = pick(['how to obtain', 'obtain', 'source', 'obtained from', 'dropped by', 'location'])?.[1];
-  if (obtain) e.addFields({ name: 'How to obtain / Source', value: String(obtain).slice(0, 1024), inline: false });
-  const stats = pick(['stats', 'effects', 'effect', 'bonuses', 'bonus', 'attributes'])?.[1];
-  if (stats) e.addFields({ name: 'Stats / Effects', value: String(stats).slice(0, 1024), inline: false });
-  const notes = pick(['notes', 'trivia', 'description'])?.[1];
-  if (notes) e.addFields({ name: 'Notes', value: String(notes).slice(0, 512), inline: false });
-
-  // include a few other non-empty infobox fields not yet shown
-  const extras = [];
-  for (const [k, v] of Object.entries(f)) {
-    if (used.has(k)) continue;
-    if (!v || String(v).length < 1) continue;
-    extras.push([k, v]);
-  }
-  if (extras.length) {
-    const text = extras.slice(0, 10).map(([k, v]) => `**${k.replace(/\b\w/g, c => c.toUpperCase())}:** ${String(v).slice(0, 120)}`).join('\n');
-    e.addFields({ name: 'Other details', value: text.slice(0, 1024), inline: false });
-  }
-
-  if (page.sections && page.sections.length) e.addFields({ name: 'Sections', value: page.sections.slice(0, 12).join(' • ').slice(0, 512), inline: false });
-  if (page.imageUrl) e.setThumbnail(page.imageUrl);
-  if (page.url) e.setURL(page.url);
-  return e;
-}
-
 function encodeTitle(title) {
-  return Buffer.from(String(title), 'utf8').toString('base64url').slice(0, 90);
+  return Buffer.from(String(title), 'utf8').toString('base64url').slice(0, 80);
 }
 function decodeTitle(s) {
   try { return Buffer.from(String(s), 'base64url').toString('utf8'); } catch { return null; }
 }
 
+const SECTION_BUTTONS = [
+  { key: 'how to obtain', label: 'How to Obtain', code: 'ob' },
+  { key: 'used in', label: 'Used In', code: 'ui' },
+  { key: 'stats', label: 'Stats', code: 'st' },
+  { key: 'effects', label: 'Effects', code: 'ef' },
+  { key: 'recipe', label: 'Recipe', code: 'rc' },
+  { key: 'recipes', label: 'Recipes', code: 'rs' },
+  { key: 'crafting', label: 'Crafting', code: 'cr' },
+  { key: 'drops', label: 'Drops', code: 'dr' },
+  { key: 'trivia', label: 'Trivia', code: 'tr' },
+  { key: 'notes', label: 'Notes', code: 'no' },
+];
+
+function findSectionCode(key) {
+  const k = norm(key);
+  const found = SECTION_BUTTONS.find(b => b.key === k);
+  if (found) return found;
+  return { key: k, label: k.replace(/\b\w/g, c => c.toUpperCase()).slice(0, 80), code: 'x_' + Buffer.from(k).toString('base64url').slice(0, 10) };
+}
+function resolveSectionCode(code, detailSections) {
+  const direct = SECTION_BUTTONS.find(b => b.code === code);
+  if (direct) return direct.key;
+  if (code && code.startsWith('x_')) {
+    const enc = code.slice(2);
+    try {
+      const k = Buffer.from(enc, 'base64url').toString('utf8');
+      if (detailSections && detailSections[k] != null) return k;
+    } catch {}
+    for (const k of Object.keys(detailSections || {})) {
+      if (Buffer.from(k).toString('base64url').slice(0, 10) === enc) return k;
+    }
+  }
+  return null;
+}
+
+function itemEmbed(page, { compact = true } = {}) {
+  const f = page.fields || {};
+  const details = page.detailSections || {};
+  const used = new Set();
+  const pick = (keys) => {
+    for (const k of keys) {
+      const kk = norm(k);
+      if (f[kk]) { used.add(kk); return [kk, f[kk]]; }
+    }
+    return null;
+  };
+
+  const keyRows = [
+    ['Category', pick(['category', 'type', 'item type'])?.[1]],
+    ['Tier', pick(['tier'])?.[1]],
+    ['Rarity', pick(['rarity'])?.[1]],
+    ['Stack', pick(['stack limit', 'stack', 'max stack'])?.[1]],
+    ['Slot', pick(['slot', 'equipment slot'])?.[1]],
+    ['Buy', pick(['buy price', 'buy', 'price', 'cost'])?.[1]],
+    ['Sell', pick(['sell price', 'sell'])?.[1]],
+    ['Level', pick(['level', 'level requirement', 'required level', 'req level'])?.[1]],
+  ].filter(([, v]) => v);
+
+  const desc = (page.description || 'No description available.').slice(0, compact ? 900 : 1800);
+  const e = base({ title: page.title, description: desc, color: theme.colors.wiki, mod: 'wiki' });
+  for (const [n, v] of keyRows.slice(0, 10)) e.addFields({ name: n, value: String(v).slice(0, 250), inline: true });
+
+  if (compact) {
+    if (details['how to obtain']) e.addFields({ name: 'How to Obtain', value: String(details['how to obtain']).slice(0, 350) + (String(details['how to obtain']).length > 350 ? '\n*…press button for full details*' : ''), inline: false });
+    if (details['used in']) e.addFields({ name: 'Used In', value: String(details['used in']).slice(0, 350) + (String(details['used in']).length > 350 ? '\n*…press button for full details*' : ''), inline: false });
+  } else {
+    for (const [k, v] of Object.entries(details)) {
+      if (!v) continue;
+      const label = k.replace(/\b\w/g, c => c.toUpperCase());
+      e.addFields({ name: label.slice(0, 256), value: String(v).slice(0, 1024), inline: false });
+    }
+  }
+
+  const extras = [];
+  for (const [k, v] of Object.entries(f)) {
+    if (used.has(k)) continue;
+    if (!v) continue;
+    extras.push([k, v]);
+  }
+  if (extras.length) {
+    const text = extras.slice(0, 8).map(([k, v]) => `**${k.replace(/\b\w/g, c => c.toUpperCase())}:** ${String(v).slice(0, 120)}`).join('\n');
+    if (text) e.addFields({ name: 'More info', value: text.slice(0, 1024), inline: false });
+  }
+
+  if (page.imageUrl) e.setThumbnail(page.imageUrl);
+  if (page.url) e.setURL(page.url);
+  return e;
+}
+
+function detailButtons(page) {
+  const details = page.detailSections || {};
+  const tEnc = encodeTitle(page.title);
+  const btns = [];
+  const prefer = ['how to obtain', 'used in', 'stats', 'effects', 'recipe', 'recipes', 'crafting', 'drops', 'trivia', 'notes'];
+  const added = new Set();
+  for (const k of prefer) {
+    if (!details[k]) continue;
+    const b = findSectionCode(k);
+    btns.push(new ButtonBuilder().setCustomId(`wk_s:${b.code}:${tEnc}`).setLabel(b.label.slice(0, 80)).setStyle(ButtonStyle.Primary));
+    added.add(k);
+    if (btns.length >= 4) break;
+  }
+  for (const k of Object.keys(details)) {
+    if (added.has(k) || btns.length >= 4) continue;
+    const b = findSectionCode(k);
+    btns.push(new ButtonBuilder().setCustomId(`wk_s:${b.code}:${tEnc}`).setLabel(b.label.slice(0, 80)).setStyle(ButtonStyle.Secondary));
+    added.add(k);
+  }
+  if (!btns.length) return [];
+  return [new ActionRowBuilder().addComponents(btns.slice(0, 5))];
+}
+
 async function buildSuggestions(query) {
   const results = await suggest(query, 5);
   if (!results.length) return null;
-  const rows = [];
   const row = new ActionRowBuilder();
   for (const r of results.slice(0, 5)) {
-    row.addComponents(
-      new ButtonBuilder()
-        .setCustomId('wk_p:' + encodeTitle(r.title))
-        .setLabel(String(r.title).slice(0, 80))
-        .setStyle(ButtonStyle.Secondary)
-    );
+    row.addComponents(new ButtonBuilder().setCustomId('wk_p:' + encodeTitle(r.title)).setLabel(String(r.title).slice(0, 80)).setStyle(ButtonStyle.Secondary));
   }
-  rows.push(row);
   const e = base({ title: 'No exact match found', description: `I couldn't find a page for **"${String(query).slice(0, 150)}"**. Did you mean one of these?`, color: theme.colors.wiki, mod: 'wiki' });
-  const list = results.map((r, i) => `${i + 1}. **${r.title}**${r.snippet ? ` — ${r.snippet.slice(0, 100)}` : ''}`).join('\n');
+  const list = results.map((r, i) => `${i + 1}. **${r.title}**${r.snippet ? ` — ${r.snippet.slice(0, 120)}` : ''}`).join('\n');
   e.addFields({ name: 'Suggestions', value: list.slice(0, 1024), inline: false });
-  return { embeds: [e], components: rows };
+  return { embeds: [e], components: [row] };
+}
+
+function sectionEmbed(page, sectionKey) {
+  const details = page.detailSections || {};
+  const text = details[sectionKey];
+  const label = sectionKey.replace(/\b\w/g, c => c.toUpperCase());
+  const e = base({ title: `${page.title} — ${label}`, description: text ? String(text).slice(0, 4000) : 'No details available for this section.', color: theme.colors.wiki, mod: 'wiki' });
+  if (page.imageUrl) e.setThumbnail(page.imageUrl);
+  if (page.url) e.setURL(page.url + '#' + encodeURIComponent(label.replace(/ /g, '_')));
+  return e;
 }
 
 function register(ctx) {
   const handler = async (interaction) => {
-    if (interaction.isButton() && interaction.customId.startsWith('wk_p:')) {
-      const title = decodeTitle(interaction.customId.slice(5));
-      if (!title) return interaction.reply({ content: 'Could not read selection.', ephemeral: true }).catch(() => {});
-      await interaction.deferUpdate().catch(() => {});
-      const page = await getPage(title);
-      if (!page) return interaction.editReply({ content: `Could not load "${title}".`, embeds: [], components: [] }).catch(() => {});
-      return interaction.editReply({ content: null, embeds: [itemEmbed(page)], components: [] }).catch(() => {});
+    try {
+      if (interaction.isButton() && interaction.customId.startsWith('wk_p:')) {
+        const title = decodeTitle(interaction.customId.slice(5));
+        if (!title) return interaction.reply({ content: 'Could not read selection.', ephemeral: true }).catch(() => {});
+        await interaction.deferUpdate().catch(() => {});
+        const page = await getPage(title);
+        if (!page) return interaction.editReply({ content: `Could not load "${title}".`, embeds: [], components: [] }).catch(() => {});
+        return interaction.editReply({ content: null, embeds: [itemEmbed(page, { compact: true })], components: detailButtons(page) }).catch(() => {});
+      }
+      if (interaction.isButton() && interaction.customId.startsWith('wk_s:')) {
+        const rest = interaction.customId.slice(5);
+        const idx = rest.indexOf(':');
+        if (idx < 0) return interaction.reply({ content: 'Invalid selection.', ephemeral: true }).catch(() => {});
+        const code = rest.slice(0, idx);
+        const title = decodeTitle(rest.slice(idx + 1));
+        if (!title) return interaction.reply({ content: 'Could not read selection.', ephemeral: true }).catch(() => {});
+        await interaction.deferUpdate().catch(() => {});
+        const page = await getPage(title);
+        if (!page) return interaction.editReply({ content: `Could not load "${title}".`, embeds: [], components: [] }).catch(() => {});
+        const secKey = resolveSectionCode(code, page.detailSections || {});
+        if (!secKey || !(page.detailSections || {})[secKey]) {
+          return interaction.editReply({ content: null, embeds: [itemEmbed(page, { compact: false })], components: detailButtons(page) }).catch(() => {});
+        }
+        const tEnc = encodeTitle(page.title);
+        const rows = detailButtons(page);
+        const overviewBtn = new ButtonBuilder().setCustomId('wk_o:' + tEnc).setLabel('Overview').setStyle(ButtonStyle.Secondary);
+        let navRow;
+        if (rows[0]) {
+          const comps = rows[0].components.slice(0, 4);
+          comps.push(overviewBtn);
+          navRow = new ActionRowBuilder().addComponents(comps);
+        } else {
+          navRow = new ActionRowBuilder().addComponents(overviewBtn);
+        }
+        return interaction.editReply({ content: null, embeds: [sectionEmbed(page, secKey)], components: [navRow] }).catch(() => {});
+      }
+      if (interaction.isButton() && interaction.customId.startsWith('wk_o:')) {
+        const title = decodeTitle(interaction.customId.slice(5));
+        if (!title) return interaction.reply({ content: 'Could not read selection.', ephemeral: true }).catch(() => {});
+        await interaction.deferUpdate().catch(() => {});
+        const page = await getPage(title);
+        if (!page) return interaction.editReply({ content: `Could not load "${title}".`, embeds: [], components: [] }).catch(() => {});
+        return interaction.editReply({ content: null, embeds: [itemEmbed(page, { compact: true })], components: detailButtons(page) }).catch(() => {});
+      }
+    } catch (e) {
+      logger.error('wiki', 'interaction_error', { err: e, id: interaction.customId });
+      try { if (interaction.deferred || interaction.replied) await interaction.editReply({ content: 'Wiki action failed.', embeds: [], components: [] }); else await interaction.reply({ content: 'Wiki action failed.', ephemeral: true }); } catch {}
     }
   };
   handler.name = name;
@@ -250,7 +516,7 @@ function register(ctx) {
       await interaction.editReply({ content: `No wiki page found for "${query}". Try different keywords.` });
       return;
     }
-    await interaction.editReply({ embeds: [itemEmbed(page)] });
+    await interaction.editReply({ embeds: [itemEmbed(page, { compact: true })], components: detailButtons(page) });
   });
   ctx.router.registerCommand('item', async (interaction) => {
     const query = interaction.options.getString('name', true);
@@ -262,7 +528,7 @@ function register(ctx) {
       await interaction.editReply({ content: `No item found for "${query}". Try different keywords.` });
       return;
     }
-    await interaction.editReply({ embeds: [itemEmbed(page)] });
+    await interaction.editReply({ embeds: [itemEmbed(page, { compact: true })], components: detailButtons(page) });
   });
 }
 
